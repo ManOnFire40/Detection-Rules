@@ -1,0 +1,127 @@
+ comment("
+ ===================================================================
+ Detection: PHP Web Shell Activity via Web Security Logs
+ Technique: T1505.003 — Server Software Component: Web Shell
+ Tactic: Persistence / Execution
+ Severity: Critical
+ Filter: Scoped to .php URIs only
+ ===================================================================
+ ")
+
+(index=waf)
+
+comment("--- Step 1: Reconstruct full observable surface ---")
+| eval raw_observable = coalesce('packet.payload', "") . " " . coalesce(request_uri, "") . " " . coalesce(log_message, "")
+| eval decoded_once = urldecode(raw_observable)
+| eval decoded_twice = urldecode(decoded_once)
+| eval normalized_payload = lower(decoded_twice)
+
+comment("--- Step 1.5: Pre-filter — PHP URI traffic only ---")
+| where match(lower(request_uri), "\.php(\?|/|$)") AND response_action!="Deny" AND response_action!="Block" AND dest_ip!="0.0.0.0"
+
+comment("--- Step 2: Detection logic ---")
+
+comment("2a: Eval-based execution pattern")
+| eval signal_eval_execution = if(
+ match(normalized_payload, "eval[[:space:]]*\([[:space:]]*(base64_decode|gzinflate|str_rot13|gzuncompress|str_replace)\s*\(")
+ OR match(normalized_payload, "eval[[:space:]]*\([[:space:]]*\$_(post|get|request)\s*\[")
+ OR match(normalized_payload, "eval[[:space:]]*\([[:space:]]*@?\$_(post|get|request)")
+ , 1, 0)
+
+comment("2b: Execution functions with request-sourced arguments")
+| eval signal_exec_dispatch = if(
+ match(normalized_payload, "(system|shell_exec|passthru|exec|popen|proc_open|pcntl_exec)[[:space:]]*\([[:space:]]*@?\$_(post|get|request)")
+ OR match(normalized_payload, "(system|shell_exec|passthru|exec)[[:space:]]*\([[:space:]]*base64_decode")
+ , 1, 0)
+
+comment("2c: Command parameter patterns")
+| eval signal_cmd_param = if(
+ match(normalized_payload, "(cmd|exec|command|shell|c|e)=(whoami|id|uname|ls[[:space:]]|cat[[:space:]]|wget|curl|nc[[:space:]]|bash|sh|powershell|net[[:space:]]user|ipconfig|ifconfig)")
+ OR match(normalized_payload, "(cmd|exec|command|shell|c|e)=([a-z0-9_\-]+[[:space:]]+-[a-z])")
+ , 1, 0)
+
+comment("2d: Payload retrieval and execution patterns")
+| eval signal_remote_fetch = if(
+ match(normalized_payload, "wget[[:space:]]+http[s]?://[^[:space:]]+[[:space:]]+-o-[[:space:]]*\|[[:space:]]*(sh|bash)")
+ OR match(normalized_payload, "system[[:space:]]*\([^)]{0,80}(wget|curl)[^)]{0,80}\|[[:space:]]*(sh|bash)")
+ OR match(normalized_payload, "curl[[:space:]]+-s[[:space:]]+http[s]?://[^[:space:]]+[[:space:]]*\|[[:space:]]*(sh|bash|python|perl)")
+ , 1, 0)
+
+comment("2e: Session upload and input stream indicators")
+| eval signal_upload_abuse = if(
+ like(normalized_payload, "%php_session_upload_progress%")
+ OR (match(normalized_payload, "php://input") AND match(normalized_payload, "(eval|system|shell_exec|passthru)"))
+ , 1, 0)
+
+comment("2f: Filesystem and shell indicators")
+| eval signal_fs_abuse = if(
+ match(normalized_payload, "(/bin/(ba)?sh|/dev/tcp/|/proc/self/|/etc/passwd|/etc/shadow)")
+ OR match(normalized_payload, "data://text/plain(;base64)?,[a-z0-9+/=]{10,}")
+ OR match(normalized_payload, "expect://")
+ , 1, 0)
+
+comment("2g: Assertion-based execution evasion")
+| eval signal_assert_exec = if(
+ match(normalized_payload, "assert[[:space:]]*\([[:space:]]*\$_(post|get|request)")
+ OR match(normalized_payload, "assert[[:space:]]*\([[:space:]]*base64_decode")
+ , 1, 0)
+
+comment("--- Step 3: Composite detection score ---")
+| eval detection_score = signal_eval_execution + signal_exec_dispatch + signal_cmd_param + signal_remote_fetch + signal_upload_abuse + signal_fs_abuse + signal_assert_exec
+| where detection_score > 0
+ AND match(lower(request_uri), "\.php(\?|/|$)")
+
+comment("--- Step 4: Technique classification ---")
+| eval technique_label = case(
+ signal_upload_abuse = 1, "T1505.003 — Session Upload Write Primitive",
+ signal_remote_fetch = 1, "T1105 — Stager / Payload Fetch",
+ signal_eval_execution = 1 AND signal_exec_dispatch = 1, "T1505.003 — Eval Dropper + Exec Dispatch (Full Chain)",
+ signal_eval_execution = 1, "T1505.003 — Eval-Based Dropper",
+ signal_exec_dispatch = 1 AND signal_cmd_param = 1, "T1505.003 — Exec Function + Command Parameter",
+ signal_exec_dispatch = 1, "T1059.004 — PHP Exec Function",
+ signal_cmd_param = 1, "T1059.004 — Command Parameter Shell Dispatch",
+ signal_assert_exec = 1, "T1027 — Assert-Based Eval Evasion",
+ signal_fs_abuse = 1, "T1059.004 — Shell Path / Protocol Abuse",
+ true(), "T1505.003 — PHP Web Shell (Uncategorized)"
+)
+
+comment("--- Step 5: Detection confidence ---")
+| eval confidence_rating = case(
+ detection_score >= 4, "CRITICAL — Multiple Corroborating Signals",
+ detection_score = 3, "HIGH — Strong Signal Overlap",
+ detection_score = 2, "MEDIUM — Two Matching Signatures",
+ detection_score = 1, "LOW — Single Signature Match"
+)
+
+comment("--- Step 6: Aggregation by source IP ---")
+| stats
+ count as total_events
+ sum(detection_score) as total_score
+ min(_time) as first_seen
+ max(_time) as last_seen
+ values(technique_label) as techniques_observed
+ values(confidence_rating) as confidence_ratings
+ values(response_action) as waf_actions
+ values(event_severity) as severity_levels
+ values(http_method) as http_methods
+ values(request_uri) as targeted_uris
+ values(request_host) as targeted_hosts
+ values(user_agent) as user_agents
+ values(dest_ip) as destination_ips
+ values(matched_rule) as matched_rules
+ values(waf_policy) as waf_policies
+ by src_ip
+
+| rename src_ip as source_ip
+
+comment("--- Step 7: Alert prioritization ---")
+| eval alert_priority = case(
+ total_score >= 6, "P1 — CRITICAL",
+ total_score >= 4, "P2 — HIGH",
+ total_score >= 2, "P3 — MEDIUM",
+ true(), "P4 — LOW"
+)
+
+| convert ctime(first_seen) ctime(last_seen)
+| sort - total_score, - total_events
+| fields alert_priority, source_ip, total_events, total_score, confidence_ratings, techniques_observed, first_seen, last_seen, http_methods, targeted_uris, targeted_hosts, user_agents, destination_ips, waf_actions, severity_levels, matched_rules, waf_policies
